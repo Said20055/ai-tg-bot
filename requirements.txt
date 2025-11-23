@@ -1,0 +1,8 @@
+aiogram>=3.10.0
+sqlalchemy
+asyncpg
+python-dotenv
+pillow
+google-genai>=0.2.0
+aiohttp
+yookassa~=3.0.1 
