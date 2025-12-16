@@ -3,6 +3,7 @@ __pycache__/
 .git
 .idea
 .env
+bot.db
 /venv
 /.env
 etc/nginx/conf/default.conf
