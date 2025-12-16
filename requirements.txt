@@ -3,6 +3,7 @@ sqlalchemy
 asyncpg
 python-dotenv
 pillow
-google-genai>=0.2.0
+aiosqlite
 aiohttp
+openai
 yookassa~=3.0.1 

@@ -1,68 +1,110 @@
 import os
-import asyncio
+import base64
 import aiohttp
-from google import genai
-from PIL import Image
+import logging
+from openai import AsyncOpenAI
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-MODEL_GOOGLE = "gemini-2.0-flash"
+# Получи ключ: https://openrouter.ai/keys
+SYSTEM_PROMPT = """
+Ты — продвинутый и полезный AI-ассистент в Telegram боте.
+Твои основные инструкции:
+1. Язык: Всегда отвечай на русском языке (если пользователь не попросил иное).
+2. Форматирование: Активно используй Markdown для улучшения читаемости:
+   - Выделяй ключевые слова **жирным**.
+   - Используй списки для перечислений.
+   - Оборачивай код в тройные кавычки (```language ... ```).
+3. Стиль: Будь вежливым, дружелюбным, но говори по делу. Избегай лишней воды.
+4. Контекст: Помни, что сообщения читают с телефона, поэтому старайся не писать огромные полотна текста без разделения на абзацы.
+5. Если вопрос касается программирования, давай рабочий и объясненный код.
+"""
 
-client = None
-if GOOGLE_API_KEY:
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "sk-or-...") 
+SITE_URL = "https://your-site-url.com" # Требование OpenRouter (можно любое)
+APP_NAME = "My Telegram Bot"
 
-# --- ЗАГОТОВЛЕННЫЙ ПРОМТ ---
-SYSTEM_INSTRUCTION = (
-    "Ты — полезный ассистент в Telegram. Отвечай на русском языке.\n"
-    "ВАЖНЫЕ ПРАВИЛА:\n"
-    "1. ФОРМАТИРОВАНИЕ: Используй ТОЛЬКО HTML теги. "
-    "Поддерживаемые теги: <b>жирный</b>, <i>курсив</i>, <code>код</code>, "
-    "<pre>блок кода</pre>, <a href='...'>ссылка</a>. "
-    "⛔️ ЗАПРЕЩЕНО использовать Markdown (символы **, __, ```), так как это вызовет ошибку.\n"
-    "2. ДЛИНА: Твой ответ СТРОГО не должен превышать 3800 символов. "
-    "Если ответ требует больше места — сократи его, выдели главное или разбей на пункты."
+# Настройка клиента
+client = AsyncOpenAI(
+    api_key=OPENROUTER_API_KEY,
+    base_url="https://api.groq.com/openai/v1",
 )
 
-async def generate_text(user_prompt: str):
-    if not client: return "Ошибка: Нет ключа Google"
+# Модели
+TEXT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct" # Или "openai/gpt-4o-mini"
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+async def generate_text(user_prompt: str) -> str:
+    """Генерация текста через OpenRouter с системным промтом"""
     try:
-        # Соединяем системный промт с запросом пользователя
-        full_prompt = f"{SYSTEM_INSTRUCTION}\n\nЗапрос пользователя: {user_prompt}"
-
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=MODEL_GOOGLE,
-            contents=full_prompt
+        completion = await client.chat.completions.create(
+            extra_headers={
+                "HTTP-Referer": SITE_URL,
+                "X-Title": APP_NAME,
+            },
+            model=TEXT_MODEL,
+            messages=[
+                # 1. Сначала даем инструкцию "кто ты"
+                {"role": "system", "content": SYSTEM_PROMPT},
+                # 2. Затем передаем запрос пользователя
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7, # 0.7 - баланс между креативностью и точностью
         )
-        return response.text
+        logging.info(f"OpenRouter Response: {completion}")
+        return completion.choices[0].message.content
     except Exception as e:
-        return f"Ошибка AI: {str(e)}"
+        print(f"Text Error: {e}")
+        return "Произошла ошибка при генерации текста. Попробуйте позже."
 
-async def analyze_image(user_prompt: str, image_bytes):
-    if not client: return "Ошибка: Нет ключа Google"
+async def analyze_image(prompt: str, image_bytes: bytes) -> str:
+    """Анализ изображения (Vision)"""
     try:
-        pil_image = Image.open(image_bytes)
-        
-        # Для картинок тоже добавляем инструкцию
-        full_prompt = [SYSTEM_INSTRUCTION, f"Запрос: {user_prompt}", pil_image]
-        
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=MODEL_GOOGLE,
-            contents=full_prompt
-        )
-        return response.text
-    except Exception as e:
-        return f"Ошибка Vision: {str(e)}"
+        # Кодируем байты в base64 строку
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
 
-async def generate_image_flux(prompt: str):
-    import random
-    seed = random.randint(1, 100000)
-    # Flux работает лучше с английским промтом, но пока оставим как есть
-    url = f"https://image.pollinations.ai/prompt/{prompt}?width=1024&height=1024&model=flux&seed={seed}&nologo=true"
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                return await resp.read()
-            return None
+        completion = await client.chat.completions.create(
+            extra_headers={
+                "HTTP-Referer": SITE_URL,
+                "X-Title": APP_NAME,
+            },
+            model=VISION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ]
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        print(f"Vision Error: {e}")
+        return "Не удалось распознать изображение."
+
+async def generate_image_flux(prompt: str) -> bytes:
+    """
+    Генерация картинки Flux. 
+    Используем Pollinations.ai (бесплатно и качественно), 
+    так как через OpenRouter генерация картинок сложнее в настройке.
+    """
+    try:
+        # Кодируем промпт для URL
+        encoded_prompt = prompt.replace(" ", "%20")
+        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?model=flux&width=1024&height=1024&nologo=true"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.read() # Возвращаем байты картинки
+                else:
+                    print(f"Flux Error: Status {resp.status}")
+                    return None
+    except Exception as e:
+        print(f"Flux Generate Error: {e}")
+        return None

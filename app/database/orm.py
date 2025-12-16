@@ -5,14 +5,14 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 
 # --- КОНФИГУРАЦИЯ ---
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASS = os.getenv("DB_PASS", "changeme")
-DB_NAME = os.getenv("DB_NAME", "ai_bot_db")
-DB_HOST = os.getenv("DB_HOST", "db")
+# SQLite хранит базу в одном файле. Здесь мы указываем имя файла "bot.db"
+DATABASE_URL = "sqlite+aiosqlite:///bot.db"
 
-DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{DB_PASS}@{DB_HOST}/{DB_NAME}"
-
+# Создаем движок
+# echo=False отключает вывод SQL-запросов в консоль (поставь True для отладки)
 engine = create_async_engine(DATABASE_URL, echo=False)
+
+# Создаем фабрику сессий
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -23,6 +23,7 @@ class User(Base):
     __tablename__ = 'users'
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # BigInteger в SQLite работает корректно, хранит большие числа (ID телеграма)
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True)
     username: Mapped[str] = mapped_column(String, nullable=True)
     full_name: Mapped[str] = mapped_column(String, nullable=True)
@@ -33,35 +34,34 @@ class User(Base):
     premium_until: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     joined_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-# --- НОВАЯ МОДЕЛЬ: ТАРИФЫ ---
+# --- МОДЕЛЬ ТАРИФОВ ---
 class Tariff(Base):
     __tablename__ = 'tariffs'
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String, nullable=False)        # Название: "1 Месяц"
-    description: Mapped[str] = mapped_column(String, nullable=True)  # Описание
-    price: Mapped[int] = mapped_column(Integer, nullable=False)      # Цена в рублях
-    duration_days: Mapped[int] = mapped_column(Integer, nullable=False) # Срок действия
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)   # Активен ли тариф?
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str] = mapped_column(String, nullable=True)
+    price: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 # --- ФУНКЦИИ ИНИЦИАЛИЗАЦИИ ---
 
 async def init_db():
-    """Создает таблицы и базовые тарифы, если их нет"""
+    """Создает таблицы и файл базы данных, если их нет"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    # Создаем базовые тарифы, если таблица пустая
+    # Создаем базовые тарифы
     await create_initial_tariffs()
 
 async def create_initial_tariffs():
     async with async_session() as session:
-        # Проверяем, есть ли хоть один тариф
+        # Проверяем наличие тарифов
         result = await session.execute(select(Tariff))
         if result.first():
-            return # Тарифы уже есть, ничего не делаем
+            return 
 
-        # Если пусто - добавляем стандартные
         tariffs = [
             Tariff(name="1 Месяц", price=299, duration_days=30, description="Стандартный план"),
             Tariff(name="3 Месяца", price=799, duration_days=90, description="Выгодный план (-10%)"),
@@ -69,7 +69,7 @@ async def create_initial_tariffs():
         ]
         session.add_all(tariffs)
         await session.commit()
-        print("✅ Базовые тарифы созданы в БД")
+        print("✅ Базовые тарифы созданы в SQLite (bot.db)")
 
 # --- ФУНКЦИИ ДЛЯ ЮЗЕРА ---
 
@@ -81,6 +81,8 @@ async def get_user(tg_id: int, username: str = None, full_name: str = None):
             user = User(telegram_id=tg_id, username=username, full_name=full_name)
             session.add(user)
             await session.commit()
+            # Обновляем объект, чтобы получить ID из базы
+            await session.refresh(user) 
             return user
         return user
 
@@ -89,20 +91,24 @@ async def add_premium_time(tg_id: int, days: int):
         result = await session.execute(select(User).where(User.telegram_id == tg_id))
         user = result.scalar_one_or_none()
         
+        if not user:
+            return None # Или обработать ошибку, если юзера нет
+
         now = datetime.utcnow()
         if user.premium_until and user.premium_until > now:
             new_date = user.premium_until + timedelta(days=days)
         else:
             new_date = now + timedelta(days=days)
             
-        await session.execute(
-            update(User).where(User.telegram_id == tg_id).values(premium_until=new_date)
-        )
+        # В SQLite обновление лучше делать через объект, но raw-update тоже работает
+        user.premium_until = new_date
+        session.add(user)
         await session.commit()
         return new_date
 
 async def increment_usage(tg_id: int, type: str):
     async with async_session() as session:
+        # Вариант с прямым SQL update работает быстрее
         field = User.text_usage if type == 'text' else User.image_usage
         await session.execute(
             update(User).where(User.telegram_id == tg_id).values({field: field + 1})
@@ -112,58 +118,42 @@ async def increment_usage(tg_id: int, type: str):
 # --- ФУНКЦИИ ДЛЯ ТАРИФОВ ---
 
 async def get_active_tariffs():
-    """Возвращает список активных тарифов для меню"""
     async with async_session() as session:
         query = select(Tariff).where(Tariff.is_active == True).order_by(Tariff.price)
         result = await session.execute(query)
         return result.scalars().all()
 
 async def get_tariff_by_id(tariff_id: int):
-    """Ищет тариф по ID"""
     async with async_session() as session:
         return await session.get(Tariff, tariff_id)
 
 async def get_all_users_ids():
-    """Возвращает список telegram_id всех пользователей (для рассылки)"""
     async with async_session() as session:
         result = await session.execute(select(User.telegram_id))
         return result.scalars().all()
 
 async def remove_premium(tg_id: int):
-    """Аннулирует подписку пользователя"""
     async with async_session() as session:
-        # Ставим дату в прошедшем времени
         past_date = datetime.utcnow() - timedelta(days=1)
         await session.execute(
             update(User).where(User.telegram_id == tg_id).values(premium_until=past_date)
         )
         await session.commit()
 
-
-# Не забудь проверить импорты наверху файла:
-# from sqlalchemy import func, select
-# from datetime import datetime
-
 async def get_stats():
     """
     Собирает полную статистику по боту.
-    Возвращает словарь с данными.
     """
     async with async_session() as session:
-        # 1. Общее количество пользователей
         total_users = await session.scalar(select(func.count(User.id)))
 
-        # 2. Количество активных премиум-подписок
-        # (где дата окончания больше, чем сейчас)
         active_premium = await session.scalar(
             select(func.count(User.id)).where(User.premium_until > datetime.utcnow())
         )
 
-        # 3. Суммарное использование (сколько всего запросов обработал бот)
         total_text = await session.scalar(select(func.sum(User.text_usage)))
         total_images = await session.scalar(select(func.sum(User.image_usage)))
 
-        # Если база пустая, SQL вернет None, заменяем на 0
         return {
             "total_users": total_users or 0,
             "active_premium": active_premium or 0,
